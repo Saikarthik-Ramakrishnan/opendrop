@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 
+from . import ui
 from .client import AirDropBrowser, AirDropClient
 from .config import AirDropConfig, AirDropReceiverFlags
 from .server import AirDropServer
@@ -67,6 +68,11 @@ class AirDropCli:
         parser.add_argument(
             "-i", "--interface", help="Which AWDL interface to use", default="awdl0"
         )
+        parser.add_argument(
+            "--auto-accept",
+            help="Accept every incoming transfer without asking",
+            action="store_true",
+        )
         args = parser.parse_args(args)
 
         if args.debug:
@@ -87,6 +93,9 @@ class AirDropCli:
             debug=args.debug,
             interface=args.interface,
         )
+        if not args.auto_accept:
+            self.config.confirm = ui.ask_user
+        self.config.notify = ui.notify
         self.server = None
         self.client = None
         self.browser = None
@@ -180,6 +189,10 @@ class AirDropCli:
     def receive(self):
         self.server = AirDropServer(self.config)
         self.server.start_service()
+        logger.info(
+            f"Ready to receive as {self.config.computer_name}. "
+            f"Files are saved in {os.getcwd()}. Press Ctrl+C to stop."
+        )
         self.server.start_server()
 
     def send(self):

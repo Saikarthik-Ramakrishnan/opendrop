@@ -22,19 +22,6 @@ import ipaddress
 import os
 
 import ifaddr
-from libarchive.entry import ArchiveEntry, new_archive_entry
-from libarchive.ffi import (  # pylint: disable=no-name-in-module
-    ARCHIVE_EOF,
-    entry_clear,
-    entry_sourcepath,
-    read_disk_descend,
-    read_next_header2,
-    write_data,
-    write_finish_entry,
-    write_get_bytes_per_block,
-    write_header,
-)
-from libarchive.write import ArchiveWrite, new_archive_read_disk
 from PIL import ExifTags, Image
 
 
@@ -111,13 +98,13 @@ class AirDropUtil:
             pass  # no EXIF data available
 
         # Big image
-        im.thumbnail((540, 540), Image.ANTIALIAS)
+        im.thumbnail((540, 540), Image.Resampling.LANCZOS)
         img_bytes = io.BytesIO()
         im.save(img_bytes, format="JPEG2000")
         file_icon = img_bytes.getvalue()
 
         # Small image
-        # im.thumbnail((64, 64), Image.ANTIALIAS)
+        # im.thumbnail((64, 64), Image.Resampling.LANCZOS)
         # img_bytes = io.BytesIO()
         # im.save(img_bytes, format='JPEG2000')
         # small_file_icon = img_bytes.getvalue()
@@ -167,40 +154,3 @@ class AirDropUtil:
                 data.seek(0)  # reset cursor position
             else:  # assume bytes-like
                 file.write(data)
-
-
-class AbsArchiveWrite(ArchiveWrite):
-    def add_abs_file(self, path, store_path):
-        """
-        Read the given paths from disk and add them to the archive.
-        """
-        write_p = self._pointer
-
-        block_size = write_get_bytes_per_block(write_p)
-        if block_size <= 0:
-            block_size = 10240  # pragma: no cover
-
-        with new_archive_entry() as entry_p:
-            entry = ArchiveEntry(None, entry_p)
-            with new_archive_read_disk(path) as read_p:
-                while True:
-                    r = read_next_header2(read_p, entry_p)
-                    if r == ARCHIVE_EOF:
-                        break
-                    entry.pathname = store_path
-                    read_disk_descend(read_p)
-                    write_header(write_p, entry_p)
-                    try:
-                        with open(entry_sourcepath(entry_p), "rb") as f:
-                            while True:
-                                data = f.read(block_size)
-                                if not data:
-                                    break
-                                write_data(write_p, data, len(data))
-                    except IOError as e:
-                        if e.errno != 21:
-                            raise  # pragma: no cover
-                    write_finish_entry(write_p)
-                    entry_clear(entry_p)
-                    if os.path.isdir(path):
-                        break

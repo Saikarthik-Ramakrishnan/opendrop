@@ -36,10 +36,10 @@ setup(
     packages=find_packages(exclude=["docs"]),
     package_data={"opendrop": ["certs/*.pem"]},
     install_requires=[
-        "Pillow",
+        "Pillow>=9.1",  # Image.Resampling
         "fleep",
         "ifaddr",
-        "libarchive-c",
+        "libarchive-c>=5.0",  # add_files(pathname=...)
         "requests",
         "requests_toolbelt",
         "zeroconf>=0.24.2",

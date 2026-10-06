@@ -24,13 +24,15 @@ import os
 import platform
 import plistlib
 import socket
+import uuid
 from http.client import HTTPSConnection
 
 import fleep
 import libarchive
 from zeroconf import IPVersion, ServiceBrowser, Zeroconf
 
-from .util import AbsArchiveWrite, AirDropUtil
+from . import dvzip
+from .util import AirDropUtil
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +94,20 @@ class AirDropClient:
         self.receiver_host = receiver[0]
         self.receiver_port = receiver[1]
         self.http_conn = None
+        # Announced in /Ask and repeated on /Upload, so the receiver can match
+        # the upload to the transfer its user accepted
+        self.transfer_id = str(uuid.uuid4()).upper()
+
+    def _connection(self):
+        if self.http_conn is None:
+            # Use single connection
+            self.http_conn = HTTPSConnectionAWDL(
+                self.receiver_host,
+                self.receiver_port,
+                interface_name=self.config.interface,
+                context=self.config.get_ssl_context(),
+            )
+        return self.http_conn
 
     def send_POST(self, url, body, headers=None):
         logger.debug(f"Send {url} request")
@@ -104,16 +120,9 @@ class AirDropClient:
         if headers is not None:
             for key, val in headers.items():
                 _headers[key] = val
-        if self.http_conn is None:
-            # Use single connection
-            self.http_conn = HTTPSConnectionAWDL(
-                self.receiver_host,
-                self.receiver_port,
-                interface_name=self.config.interface,
-                context=self.config.get_ssl_context(),
-            )
-        self.http_conn.request("POST", url, body=body, headers=_headers)
-        http_resp = self.http_conn.getresponse()
+        conn = self._connection()
+        conn.request("POST", url, body=body, headers=_headers)
+        http_resp = conn.getresponse()
 
         response_bytes = http_resp.read()
         AirDropUtil.write_debug(
@@ -151,6 +160,9 @@ class AirDropClient:
             "SenderModelName": self.config.computer_model,
             "SenderID": self.config.service_id,
             "ConvertMediaFormats": False,
+            # Current iOS refuses an upload whose transfer was not announced here
+            "TransferID": {"id": self.transfer_id},
+            "TransferType": {"files": {}},
         }
         if self.config.record_data:
             ask_body["SenderRecordData"] = self.config.record_data
@@ -158,12 +170,15 @@ class AirDropClient:
         def file_entries(files):
             for file in files:
                 file_name = os.path.basename(file)
+                with open(file, "rb") as f:
+                    file_type = AirDropUtil.get_uti_type(fleep.get(f.read(128)))
                 file_entry = {
                     "FileName": file_name,
-                    "FileType": AirDropUtil.get_uti_type(flp),
+                    "FileType": file_type,
+                    "FileSize": os.path.getsize(file),
                     "FileBomPath": os.path.join(".", file_name),
-                    "FileIsDirectory": os.path.isdir(file_name),
-                    "ConvertMediaFormats": 0,
+                    "FileIsDirectory": os.path.isdir(file),
+                    "ShouldConvertMediaFormats": False,
                 }
                 yield file_entry
 
@@ -197,29 +212,44 @@ class AirDropClient:
         if is_url:
             return
 
-        headers = {
-            "Content-Type": "application/x-cpio",
-        }
-
         # Create archive in memory ...
+        # TODO stream the archive instead of holding it in memory
         stream = io.BytesIO()
-        with libarchive.custom_writer(
-            stream.write,
-            "cpio",
-            filter_name="gzip",
-            archive_write_class=AbsArchiveWrite,
-        ) as archive:
+        with libarchive.custom_writer(stream.write, "cpio") as archive:
             for f in [file_path]:
                 ff = os.path.basename(f)
-                archive.add_abs_file(f, os.path.join(".", ff))
-        stream.seek(0)
+                archive.add_files(f, pathname=os.path.join(".", ff))
+        AirDropUtil.write_debug(self.config, stream.getvalue(), "send_upload.cpio")
 
-        # ... then send in chunked mode
-        success, _ = self.send_POST("/Upload", stream, headers=headers)
+        # ... then send it the way current iOS does: wrapped in DVZip, chunked,
+        # with an iPhone's /Upload headers in an iPhone's order. TotalBytes is the
+        # size of the files themselves, not of the request body.
+        headers = {
+            "User-Agent": "AirDrop/1.0",
+            "TotalBytes": str(os.path.getsize(file_path)),
+            "Content-Type": "application/x-dvzip",
+            "TransferID": self.transfer_id,
+            "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked",
+        }
+        logger.debug("Send /Upload request")
+        conn = self._connection()
+        # request() would add Host and Accept-Encoding, which iOS never sends
+        conn.putrequest("POST", "/Upload", skip_host=True, skip_accept_encoding=True)
+        for key, val in headers.items():
+            conn.putheader(key, val)
+        conn.endheaders()
+        for block in dvzip.blocks(stream.getvalue()):
+            conn.send(b"%x\r\n%s\r\n" % (len(block), block))
+        conn.send(b"0\r\n\r\n")
+        http_resp = conn.getresponse()
+        http_resp.read()
 
-        # TODO better: write archive chunk whenever send_POST does a read to avoid having the whole archive in memory
-
-        return success
+        if http_resp.status != 200:
+            logger.debug(f"/Upload request failed: {http_resp.status}")
+            return False
+        logger.debug("/Upload request successful")
+        return True
 
     def _get_headers(self):
         """
@@ -263,15 +293,16 @@ class HTTPSConnectionAWDL(HTTPSConnection):
         if timeout is None:
             timeout = socket.getdefaulttimeout()
 
+        # key_file, cert_file and check_hostname were removed in Python 3.12;
+        # the certificate is configured on `context` instead
+        if check_hostname is not None and context is not None:
+            context.check_hostname = check_hostname
         super(HTTPSConnectionAWDL, self).__init__(
             host=host,
             port=port,
-            key_file=key_file,
-            cert_file=cert_file,
             timeout=timeout,
             source_address=source_address,
             context=context,
-            check_hostname=check_hostname,
         )
 
         self.interface_name = interface_name

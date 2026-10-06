@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import logging
 import os
+import platform
 import random
 import socket
 import ssl
@@ -73,7 +74,7 @@ class AirDropConfig:
             host_name = socket.gethostname()
         self.host_name = host_name
         if computer_name is None:
-            computer_name = host_name
+            computer_name = self._display_name() or host_name
         self.computer_name = computer_name
         if computer_model is None:
             computer_model = "OpenDrop"
@@ -81,8 +82,14 @@ class AirDropConfig:
         self.port = server_port
 
         if service_id is None:
-            service_id = f"{random.randint(0, 0xFFFFFFFFFFFF):012x}"  # random 6-byte string in base16
+            service_id = self._load_service_id()
         self.service_id = service_id
+
+        # Called with the parsed /Ask request; return False to decline.
+        # None accepts every transfer.
+        self.confirm = None
+        # Called with a short message after a transfer was received
+        self.notify = None
 
         self.debug = debug
         self.debug_dir = os.path.join(self.airdrop_dir, "debug")
@@ -100,7 +107,8 @@ class AirDropConfig:
 
         # Bare minimum, we currently do not support anything else
         self.flags = (
-            AirDropReceiverFlags.SUPPORTS_MIXED_TYPES
+            AirDropReceiverFlags.SUPPORTS_DVZIP
+            | AirDropReceiverFlags.SUPPORTS_MIXED_TYPES
             | AirDropReceiverFlags.SUPPORTS_DISCOVER_MAYBE
         )
 
@@ -126,6 +134,44 @@ class AirDropConfig:
                 self.record_data = f.read()
         else:
             logger.debug("No Apple ID Validation Record found")
+
+    @staticmethod
+    def _display_name():
+        """
+        The name people know this computer by, e.g. "Jane's MacBook Pro"
+        """
+        if platform.system() != "Darwin":
+            return None
+        try:
+            result = subprocess.run(
+                ["scutil", "--get", "ComputerName"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return result.stdout.strip() or None
+
+    def _load_service_id(self):
+        """
+        Keep one service ID per machine, so a restarted receiver replaces its
+        old entry on other devices instead of appearing twice
+        """
+        path = os.path.join(self.airdrop_dir, "service_id")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                service_id = f.read().strip()
+            if len(service_id) == 12 and int(service_id, 16) >= 0:
+                return service_id
+        except (OSError, ValueError):
+            pass
+        service_id = f"{random.randint(0, 0xFFFFFFFFFFFF):012x}"  # random 6-byte string in base16
+        os.makedirs(self.airdrop_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(service_id)
+        return service_id
 
     def create_default_key(self):
         logger.info(f"Create new self-signed certificate in {self.key_dir}")

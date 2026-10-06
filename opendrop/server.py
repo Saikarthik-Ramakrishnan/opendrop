@@ -16,23 +16,105 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
+
 import io
 import json
 import logging
+import os
 import platform
 import plistlib
+import shutil
 import socket
+import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 
 import libarchive
 import libarchive.extract
 import libarchive.read
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
+from .dvzip import DvzipReader
+from .ui import clean
 from .util import AirDropUtil
 
 logger = logging.getLogger(__name__)
+
+# Senders are untrusted: refuse "../" and absolute paths and writes through symlinks
+SECURE_EXTRACT = (
+    libarchive.extract.EXTRACT_SECURE_NODOTDOT
+    | libarchive.extract.EXTRACT_SECURE_NOABSOLUTEPATHS
+    | libarchive.extract.EXTRACT_SECURE_SYMLINKS
+)
+
+
+class CheckedStream(io.RawIOBase):
+    """
+    libarchive turns an exception raised while reading into a quiet end of
+    file, which a short archive could survive. Remember the error instead, so
+    the transfer can be refused after extraction.
+    """
+
+    def __init__(self, stream):
+        super().__init__()
+        self.stream = stream
+        self.error = None
+
+    def readable(self):
+        return True
+
+    def readinto(self, buf):
+        if self.error is not None:
+            return 0
+        try:
+            return self.stream.readinto(buf)
+        except (ValueError, OSError) as e:
+            self.error = e
+            return 0
+
+
+def extract_archive(stream):
+    """
+    Extract an untrusted archive into the current directory. Files are staged
+    first and only moved into place once the whole archive was read, without
+    replacing existing files. Returns the names they were saved under.
+    """
+    directory = os.getcwd()
+    staging = tempfile.mkdtemp(prefix=".opendrop-", dir=directory)
+    try:
+        checked = CheckedStream(stream)
+        with libarchive.read.stream_reader(checked) as archive:
+
+            def staged_entries():
+                for entry in archive:
+                    # AirDrop only sends files and folders
+                    if not (entry.isfile or entry.isdir):
+                        raise ValueError(f"Unsupported entry type: {entry.pathname}")
+                    # relative, since extraction refuses absolute paths
+                    entry.pathname = os.path.join(
+                        os.path.relpath(staging), entry.pathname
+                    )
+                    yield entry
+
+            libarchive.extract.extract_entries(staged_entries(), SECURE_EXTRACT)
+        if checked.error is not None:
+            raise ValueError(f"Upload failed: {checked.error}")
+        return [
+            _move_without_replacing(os.path.join(staging, name), directory)
+            for name in sorted(os.listdir(staging))
+        ]
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _move_without_replacing(path, directory):
+    base, ext = os.path.splitext(os.path.basename(path))
+    name, number = base + ext, 2
+    while os.path.lexists(os.path.join(directory, name)):
+        name, number = f"{base} {number}{ext}", number + 1
+    os.rename(path, os.path.join(directory, name))
+    return name
 
 
 class AirDropServer:
@@ -125,8 +207,10 @@ class AirDropServer:
         return properties
 
 
-class HTTPServerV6(HTTPServer):
+class HTTPServerV6(ThreadingMixIn, HTTPServer):
+    # Threads, so a sender waiting for the user to accept doesn't block others
     address_family = socket.AF_INET6
+    daemon_threads = True
 
 
 class AirDropServerHandler(BaseHTTPRequestHandler):
@@ -136,6 +220,10 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
     config = None
+    # Transfers the user accepted, by TransferID, until their upload arrives
+    accepted = {}
+    # Set on this connection's handler once its /Ask was accepted
+    approved = None
 
     def _set_response(self, content_length):
         """
@@ -144,6 +232,29 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Length", content_length)
         self.end_headers()
+
+    def _send_empty(self, status):
+        self.send_response(status)
+        self.send_header("Content-Length", 0)
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def _read_body(self):
+        """
+        Read the request body, sent either with a Content-Length or chunked
+        """
+        if self.headers.get("transfer-encoding", "").lower() != "chunked":
+            return self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        body = bytearray()
+        while True:
+            length = int(self.rfile.readline().split(b";")[0].strip(), 16)
+            if length == 0:
+                # skip optional trailers up to the terminating empty line
+                while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+                    pass
+                return bytes(body)
+            body += self.rfile.read(length)
+            self.rfile.readline()  # CRLF after each chunk
 
     def do_HEAD(self):
         """
@@ -163,8 +274,7 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def handle_discover(self):
-        content_length = int(self.headers["Content-Length"])
-        post_data = self.rfile.read(content_length)
+        post_data = self._read_body()
 
         AirDropUtil.write_debug(
             self.config, post_data, "receive_discover_request.plist"
@@ -222,10 +332,28 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(discover_answer_binary)
 
     def handle_ask(self):
-        content_length = int(self.headers["Content-Length"])
-        post_data = self.rfile.read(content_length)
+        post_data = self._read_body()
 
         AirDropUtil.write_debug(self.config, post_data, "receive_ask_request.plist")
+
+        try:
+            ask = plistlib.loads(post_data)
+        except Exception:  # pylint: disable=broad-except
+            ask = None
+        if not isinstance(ask, dict):
+            logger.warning("Rejected malformed /Ask request")
+            self._send_empty(400)
+            return
+
+        if self.config.confirm is not None and not self.config.confirm(ask):
+            logger.info("Transfer declined")
+            self._send_empty(403)  # the sender shows "Declined"
+            return
+
+        self.approved = ask
+        transfer_id = ask.get("TransferID")
+        if isinstance(transfer_id, dict) and transfer_id.get("id"):
+            self.accepted[str(transfer_id["id"])] = ask
 
         ask_response = {
             "ReceiverModelName": self.config.computer_model,
@@ -243,16 +371,30 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(ask_resp_binary)
 
     def handle_upload(self):
-        if self.headers.get("content-type", "").lower() != "application/x-cpio":
+        if self.headers.get("content-type", "").lower() not in (
+            "application/x-cpio",
+            "application/x-dvzip",
+        ):
             logger.warning(
                 f"Unsupported content-type: {self.headers.get('content-type')}"
             )
+            # Unlike _send_empty, also tells the sender what we do accept
             self.send_response(406)  # Unprocessable Entity
             self.send_header("Content-Type", "application/x-cpio")
             self.send_header("Content-Length", 0)
             self.send_header("Connection", "close")
             self.end_headers()
             return
+
+        # Only accept uploads for a transfer the user agreed to, matched by the
+        # TransferID that current iOS repeats from /Ask or by this connection
+        ask = self.accepted.pop(self.headers.get("TransferID", ""), None)
+        ask = ask or self.approved
+        if ask is None:
+            logger.warning("Rejected upload without an accepted /Ask")
+            self._send_empty(403)
+            return
+        self.approved = None
 
         # If pipelining is not support, 'Expect: 100-continue' is sent to which we need to respond
         if self.headers.get("expect", "").lower() == "100-continue":
@@ -270,11 +412,12 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
             return
 
         class HTTPChunkedReader(io.RawIOBase):
-            def __init__(self, rfile, *args, **kwargs):
-                super().__init__(*args, **kwargs)
+            def __init__(self, rfile, keep=False):
+                super().__init__()
                 self.rfile = rfile
                 self.chunk = None
                 self.total = 0
+                self.raw = bytearray() if keep else None  # for --debug captures
 
             def _next_chunk(self):
                 if self.chunk is None or len(self.chunk) == 0:
@@ -288,46 +431,40 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
                 buf[:length] = self.chunk[:length]
                 self.chunk = self.chunk[length:]
                 self.total += length
+                if self.raw is not None:
+                    self.raw += buf[:length]
                 return length
-
-        def extract_stream(stream, flags=0):
-            """
-            Extracts an archive from memory into the current directory.
-            """
-
-            with libarchive.read.stream_reader(stream) as archive:
-                libarchive.extract.extract_entries(archive, flags)
 
         logger.info("Receiving file(s) ...")
         start = time.time()
-        reader = HTTPChunkedReader(self.rfile)
+        reader = HTTPChunkedReader(self.rfile, keep=self.config.debug)
+        stream = reader
+        if self.headers.get("content-type", "").lower() == "application/x-dvzip":
+            stream = DvzipReader(reader)
         try:
-            # Senders are untrusted: refuse "../" and absolute paths and writes
-            # through symlinks, so nothing lands outside the current directory
-            extract_stream(
-                reader,
-                libarchive.extract.EXTRACT_SECURE_NODOTDOT
-                | libarchive.extract.EXTRACT_SECURE_NOABSOLUTEPATHS
-                | libarchive.extract.EXTRACT_SECURE_SYMLINKS,
-            )
-        except libarchive.ArchiveError as e:
+            saved = extract_archive(stream)
+        except (libarchive.ArchiveError, ValueError) as e:
             logger.warning(f"Rejected unsafe or malformed archive: {e}")
-            self.send_response(400)  # Bad Request
-            self.send_header("Content-Length", 0)
-            self.send_header("Connection", "close")
-            self.end_headers()
+            self._send_empty(400)
             return
+        finally:
+            if reader.raw is not None:
+                AirDropUtil.write_debug(
+                    self.config, bytes(reader.raw), "receive_upload_request.bin"
+                )
 
         transferred = reader.total / 1024.0 / 1024.0
         speed = transferred / (time.time() - start)
         logger.info(
-            f"File(s) received (size {transferred:.02f} MB, speed {speed:.02f} MB/s)"
+            f"Saved {', '.join(saved)} "
+            f"(size {transferred:.02f} MB, speed {speed:.02f} MB/s)"
         )
+        if self.config.notify is not None:
+            sender = clean(ask.get("SenderComputerName") or "someone nearby")
+            what = clean(saved[0]) if len(saved) == 1 else f"{len(saved)} items"
+            self.config.notify(f"Received {what} from {sender}")
 
-        self.send_response(200)
-        self.send_header("Content-Length", 0)
-        self.send_header("Connection", "close")
-        self.end_headers()
+        self._send_empty(200)
 
     def do_POST(self):
         """
